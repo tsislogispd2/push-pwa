@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#1a73e8">
+  <link rel="manifest" href="manifest.json">
+  <link rel="apple-touch-icon" href="icon-192.png">
+  <title>ระบบแจ้งเตือน</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, "Noto Sans Thai", sans-serif; margin: 0; background: #f1f3f4; color: #202124; }
+    .wrap { max-width: 480px; margin: 0 auto; padding: 24px 16px; }
+    .card { background: #fff; border-radius: 16px; padding: 20px; box-shadow: 0 1px 4px rgba(0,0,0,.12); margin-bottom: 16px; }
+    h1 { font-size: 1.4rem; margin: 0 0 4px; }
+    p { margin: 6px 0; line-height: 1.5; }
+    input { width: 100%; padding: 12px; border: 1px solid #dadce0; border-radius: 10px; font-size: 1rem; margin: 8px 0; }
+    button { width: 100%; padding: 14px; border: 0; border-radius: 10px; font-size: 1rem; font-weight: 600; cursor: pointer; margin-top: 8px; }
+    .primary { background: #1a73e8; color: #fff; }
+    .danger { background: #fce8e6; color: #c5221f; }
+    button:disabled { opacity: .5; cursor: not-allowed; }
+    #status { font-size: .95rem; padding: 10px 12px; border-radius: 10px; background: #e8f0fe; }
+    #status.ok { background: #e6f4ea; color: #137333; }
+    #status.err { background: #fce8e6; color: #c5221f; }
+    .hint { font-size: .85rem; color: #5f6368; }
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <div class="card">
+    <h1>🔔 ระบบแจ้งเตือน</h1>
+    <p class="hint">กดเปิดการแจ้งเตือนเพื่อรับข้อความบนมือถือเครื่องนี้</p>
+    <div id="iosHint" class="hint" style="display:none">
+      <b>iPhone/iPad:</b> ต้องกด Share → "เพิ่มไปยังหน้าจอโฮม" แล้วเปิดแอปจากไอคอนบนหน้าจอโฮมก่อน (iOS 16.4 ขึ้นไป)
+    </div>
+  </div>
+
+  <div class="card">
+    <input id="name" type="text" placeholder="ชื่อ/ชื่อเครื่อง (ไม่บังคับ)">
+    <button id="btnOn" class="primary">เปิดการแจ้งเตือน</button>
+    <button id="btnOff" class="danger" style="display:none">ปิดการแจ้งเตือนเครื่องนี้</button>
+    <p id="status">กำลังตรวจสอบ...</p>
+  </div>
+</div>
+
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-messaging-compat.js"></script>
+<script>
+  // ===== แก้ค่าตรงนี้ =====
+  const FIREBASE_CONFIG = {
+    apiKey: "AIzaSyAY6hxVbTaR_y4TAjE5x48yFfp2JvdF1NA",
+    authDomain: "notification-logis.firebaseapp.com",
+    projectId: "notification-logis",
+    storageBucket: "notification-logis.firebasestorage.app",
+    messagingSenderId: "769100859721",
+    appId: "1:769100859721:web:d0aab12924931c423c3298"
+  };
+  const VAPID_KEY = 'BEIZAHG6JCeF_xMU5QBzFloCnBqcN9i3wsUIO2g-OWVg8PWkOL8nCHjZFHL2Nev9-Ql0mBMuw0-pXQMBFrkc4LY';
+  const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbzoMt3X1SylSNPTA1YebcpTKGFSwAIeWClwNbBxFK_0AvZ-7cYIz96pJq5Ht6ubLPk/exec';
+  // ========================
+
+  const $ = (id) => document.getElementById(id);
+  const statusEl = $('status');
+  const LS_TOKEN = 'push_token';
+  let swReg = null;
+  let messaging = null;
+
+  function setStatus(msg, cls) {
+    statusEl.textContent = msg;
+    statusEl.className = cls || '';
+  }
+
+  function isIOS() { return /iphone|ipad|ipod/i.test(navigator.userAgent); }
+  function isStandalone() {
+    return window.matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+  }
+
+  function showSubscribed(on) {
+    $('btnOn').style.display = on ? 'none' : 'block';
+    $('btnOff').style.display = on ? 'block' : 'none';
+  }
+
+  async function postToScript(body) {
+    // ใช้ text/plain เพื่อไม่ให้เกิด CORS preflight กับ Apps Script
+    const res = await fetch(APPS_SCRIPT_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify(body)
+    });
+    return res.json();
+  }
+
+  async function init() {
+    if (isIOS() && !isStandalone()) $('iosHint').style.display = 'block';
+
+    if (!('serviceWorker' in navigator) || !('PushManager' in window) || !('Notification' in window)) {
+      setStatus('อุปกรณ์/เบราว์เซอร์นี้ไม่รองรับ Web Push' +
+        (isIOS() ? ' (บน iPhone ให้เพิ่มไปหน้าจอโฮมก่อน)' : ''), 'err');
+      $('btnOn').disabled = true;
+      return;
+    }
+
+    firebase.initializeApp(FIREBASE_CONFIG);
+    messaging = firebase.messaging();
+    swReg = await navigator.serviceWorker.register('./firebase-messaging-sw.js');
+
+    // แสดงแจ้งเตือนเมื่อเปิดหน้าเว็บค้างอยู่ (foreground)
+    messaging.onMessage((payload) => {
+      const d = payload.data || {};
+      swReg.showNotification(d.title || 'แจ้งเตือน', {
+        body: d.body || '',
+        icon: 'icon-192.png',
+        data: { url: d.url || '' }
+      });
+    });
+
+    if (Notification.permission === 'granted' && localStorage.getItem(LS_TOKEN)) {
+      showSubscribed(true);
+      setStatus('เปิดการแจ้งเตือนอยู่ ✅', 'ok');
+    } else if (Notification.permission === 'denied') {
+      setStatus('การแจ้งเตือนถูกบล็อก กรุณาเปิดในตั้งค่าเบราว์เซอร์/ระบบ', 'err');
+    } else {
+      setStatus('ยังไม่ได้เปิดการแจ้งเตือน');
+    }
+  }
+
+  $('btnOn').addEventListener('click', async () => {
+    $('btnOn').disabled = true;
+    try {
+      setStatus('กำลังขออนุญาต...');
+      const perm = await Notification.requestPermission();
+      if (perm !== 'granted') {
+        setStatus('ไม่ได้รับอนุญาตให้แจ้งเตือน', 'err');
+        return;
+      }
+      setStatus('กำลังลงทะเบียน...');
+      const token = await messaging.getToken({ vapidKey: VAPID_KEY, serviceWorkerRegistration: swReg });
+      if (!token) throw new Error('ไม่ได้รับ token');
+
+      const r = await postToScript({
+        action: 'register',
+        token: token,
+        name: $('name').value.trim(),
+        ua: navigator.userAgent
+      });
+      if (!r.ok) throw new Error(r.error || 'ลงทะเบียนไม่สำเร็จ');
+
+      localStorage.setItem(LS_TOKEN, token);
+      showSubscribed(true);
+      setStatus('เปิดการแจ้งเตือนเรียบร้อย ✅', 'ok');
+    } catch (e) {
+      setStatus('เกิดข้อผิดพลาด: ' + e.message, 'err');
+    } finally {
+      $('btnOn').disabled = false;
+    }
+  });
+
+  $('btnOff').addEventListener('click', async () => {
+    try {
+      const token = localStorage.getItem(LS_TOKEN);
+      if (token) await postToScript({ action: 'unregister', token: token });
+      await messaging.deleteToken();
+      localStorage.removeItem(LS_TOKEN);
+      showSubscribed(false);
+      setStatus('ปิดการแจ้งเตือนแล้ว');
+    } catch (e) {
+      setStatus('เกิดข้อผิดพลาด: ' + e.message, 'err');
+    }
+  });
+
+  init();
+</script>
+</body>
+</html>
